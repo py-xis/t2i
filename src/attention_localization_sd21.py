@@ -157,6 +157,7 @@ def sample(
                 attn_heads_idx_to_patch=attn_heads_idx_to_patch,
                 timestep_start_patching=timestep_start_patching,
                 guidance_scale=GUIDANCE_SCALE,
+                device_map="balanced"  # Automatically distribute across available GPUs
             ).images
             images = images * 255
             all_images[batch_start : batch_start + batch_size] = images.astype(np.uint8)
