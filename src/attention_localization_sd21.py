@@ -2,6 +2,7 @@
 
 import logging
 import os
+import sys
 import time
 
 import clip
@@ -10,6 +11,18 @@ import pandas as pd
 import torch
 from PIL import Image
 from tqdm import tqdm
+
+"""
+Make this script runnable when invoked directly (e.g., on Kaggle):
+- Add the repo root to sys.path so `import src.*` works.
+- Add local diffusers src to sys.path if present (so our patched pipelines are used).
+"""
+THIS_DIR = os.path.dirname(os.path.abspath(__file__))
+REPO_ROOT = os.path.abspath(os.path.join(THIS_DIR, ".."))
+DIFFUSERS_SRC = os.path.join(REPO_ROOT, "diffusers", "src")
+for _p in (REPO_ROOT, DIFFUSERS_SRC):
+    if os.path.isdir(_p) and _p not in sys.path:
+        sys.path.insert(0, _p)
 
 from diffusers import StableDiffusionPipeline
 from diffusers.training_utils import set_seed
