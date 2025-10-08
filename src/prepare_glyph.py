@@ -96,6 +96,54 @@ def prepare_prompts_glyph_simple_bench_top_100(n_samples_per_prompt=1):
     assert set([p["text"] for p in prompts_A]) == set([p["text"] for p in prompts_B])
     return prompts_A, prompts_B
 
+def prepare_prompts_glyph_creative_bench_top_100(n_samples_per_prompt=1, use_different_templates=False):
+    # Same return signature as prepare_prompts_glyph_creative_bench
+    prompts_A, prompts_B, prompts_AB, templates_A, templates_B = [], [], [], [], []
+
+    with open(CREATIVE_PROMPT_TEMPLATES_PATH, "r") as promptf:
+        prompt_templates = promptf.readlines()
+
+    # Only the top-100 list
+    top100_path = os.path.join(SIMPLE_PATH, "all_unigram_top_1000_100.txt")
+    with open(top100_path, "r") as promptf:
+        all_words = promptf.readlines()
+
+    text_B_indices_init = set(range(len(all_words)))
+    for i, text_A in enumerate(all_words):
+        # fresh pool each outer iteration to avoid running out too early
+        text_B_indices = set(text_B_indices_init)
+        if i in text_B_indices:
+            text_B_indices.remove(i)
+        if not text_B_indices:
+            continue
+        text_B_ind = np.random.choice(list(text_B_indices))
+        text_B = all_words[text_B_ind]
+
+        t1 = np.random.choice(prompt_templates).strip()
+        if use_different_templates:
+            t2 = np.random.choice(prompt_templates).strip()
+            while t2 == t1:
+                t2 = np.random.choice(prompt_templates).strip()
+        else:
+            t2 = t1
+
+        for _ in range(n_samples_per_prompt):
+            prompts_A.append({"text": text_A.strip(), "prompt": t1.replace('""', f'"{text_A.strip()}"')})
+            prompts_B.append({"text": text_B.strip(), "prompt": t2.replace('""', f'"{text_B.strip()}"')})
+            prompts_AB.append({"text": text_B.strip(), "prompt": t1.replace('""', f'"{text_B.strip()}"')})
+            templates_A.append(t1)
+            templates_B.append(t2)
+
+    assert len(prompts_A) == len(prompts_B)
+    # top-100 list → 100 * n_samples_per_prompt
+    assert len(prompts_A) == 100 * n_samples_per_prompt
+    assert len(prompts_B) == 100 * n_samples_per_prompt
+    if use_different_templates:
+        assert len(prompts_AB) == 100 * n_samples_per_prompt
+        assert set([p["text"] for p in prompts_B]) == set([p["text"] for p in prompts_AB])
+    assert set([p["text"] for p in prompts_A]) == set([p["text"] for p in prompts_B])
+    return prompts_A, prompts_B, prompts_AB, templates_A, templates_B
+
 
 def prepare_prompts_glyph_creative_bench(n_samples_per_prompt=1, use_different_templates=False):
     prompts_A = []
