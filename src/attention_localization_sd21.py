@@ -136,7 +136,6 @@ clip_model.eval()
 def sample(
     prompts,
     noise,
-    batch_size,
     num_inference_steps,
     generator,
     device,
@@ -145,29 +144,21 @@ def sample(
     attn_heads_idx_to_patch=None,
     timestep_start_patching=0,
 ):
-    all_images = np.zeros((len(prompts), 512, 512, 3), dtype=np.uint8)
-    with tqdm(total=len(prompts)) as pbar:
-        for batch_num, batch_start in enumerate(range(0, len(prompts), batch_size)):
-            prompt = prompts[batch_start : batch_start + batch_size]
-            latent = noise[batch_start : batch_start + batch_size].to(device)
-            images = pipe(
-                prompt=prompt,
-                num_inference_steps=num_inference_steps,
-                generator=generator,
-                latents=latent,
-                run_with_cache=run_with_cache,
-                attn_idx_to_patch=attn_idx_to_patch,
-                output_type="np",
-                batch_num=batch_num,
-                attn_heads_idx_to_patch=attn_heads_idx_to_patch,
-                timestep_start_patching=timestep_start_patching,
-                guidance_scale=GUIDANCE_SCALE,
-                # device_map is a load-time argument; dispatch already happened when loading the pipeline.
-            ).images
-            images = images * 255
-            all_images[batch_start : batch_start + batch_size] = images.astype(np.uint8)
-            pbar.update(len(prompt))
-    return all_images
+    # Process all prompts in a single call
+    latent = noise.to(device)
+    images = pipe(
+        prompt=prompts,
+        num_inference_steps=num_inference_steps,
+        generator=generator,
+        latents=latent,
+        run_with_cache=run_with_cache,
+        attn_idx_to_patch=attn_idx_to_patch,
+        attn_heads_idx_to_patch=attn_heads_idx_to_patch,
+        timestep_start_patching=timestep_start_patching,
+        guidance_scale=GUIDANCE_SCALE,
+    ).images
+    images = (images * 255).astype(np.uint8)
+    return images
 
 
 def calculate_metrics(
@@ -194,7 +185,7 @@ def calculate_metrics(
         batch_size,
         prompts_A,
         prompts_B,
-    )
+    )[:3]  # Take only the first three values
     from src.eval.text_distance import get_levenshtein_distances
     leve_A = get_levenshtein_distances(ocr_texts, texts_A)
     leve_B = get_levenshtein_distances(ocr_texts, texts_B)
@@ -225,7 +216,6 @@ logging.info("Sampling original images A ...")
 original_images_A = sample(
     [p["prompt"] for p in prompts_A],
     noises,
-    BATCH_SIZE,
     NUM_INFERENCE_STEPS,
     torch.Generator().manual_seed(SEED),
     DEVICE,
@@ -241,7 +231,6 @@ logging.info("Sampling original images B ...")
 original_images_B = sample(
     [p["prompt"] for p in prompts_B],
     noises,
-    BATCH_SIZE,
     NUM_INFERENCE_STEPS,
     torch.Generator().manual_seed(SEED),
     DEVICE,
@@ -309,44 +298,23 @@ logging.info(
 )
 
 for attn_idx in tqdm(range(num_blocks)):
+    logging.info(f"Processing attention block: {attn_idx}")
+
+    # Perform sampling with the specific attention block patched
     patched_images = sample(
         [p["prompt"] for p in prompts_A],
         noises,
-        BATCH_SIZE,
         NUM_INFERENCE_STEPS,
         torch.Generator().manual_seed(SEED),
         DEVICE,
         run_with_cache=False,
         attn_idx_to_patch=attn_idx,
     )
-    patched_images_metrics = calculate_metrics(
-        original_images_A,
-        original_images_A_feats,
-        patched_images,
-        [p["text"] for p in prompts_A],
-        [p["text"] for p in prompts_B],
-        [p["prompt"] for p in prompts_A],
-        [p["prompt"] for p in prompts_B],
-        DEVICE,
-        BATCH_SIZE,
-    )
 
-    patched_images_df = pd.DataFrame(
-        patched_images_metrics,
-    )
-    patched_images_df["Block_patched"] = [
-        f"A{set_to_string([attn_idx])}" for _ in range(len(prompts_A))
-    ]
-
-    all_metrics_df = pd.concat([all_metrics_df, patched_images_df])
-
-    np.save(
-        os.path.join(
-            SAVE_DIR,
-            f"A{set_to_string([attn_idx])}.npy",
-        ),
-        patched_images,
-    )
+    # Save the patched images
+    save_path = os.path.join(SAVE_DIR, f"A{set_to_string([attn_idx])}.npy")
+    logging.info(f"Saving patched images to: {save_path}")
+    np.save(save_path, patched_images)
 
 # Save DataFrame to CSV file
 all_metrics_df.to_csv(os.path.join(SAVE_DIR, "metrics.csv"))
