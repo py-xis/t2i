@@ -94,13 +94,17 @@ def image_grid(imgs, rows, cols):
 set_seed(SEED)
 
 dtype = torch.float32 if DEVICE == "cpu" else torch.float16
+# Load the pipeline and let HF/accelerate dispatch model parts across available GPUs.
+# Do NOT call .to(DEVICE) after loading when using device_map — that would move everything
+# back to a single device.
 pipe = StableDiffusionPipeline.from_pretrained(
     SD21_MODEL_NAME_OR_PATH,
     variant="fp16" if dtype == torch.float16 else None,
     use_safetensors=True,
     token=os.environ.get("HF_TOKEN"),
     torch_dtype=dtype,
-).to(DEVICE)
+    device_map="balanced",
+)
 
 pipe.set_progress_bar_config(disable=True)
 
@@ -157,7 +161,7 @@ def sample(
                 attn_heads_idx_to_patch=attn_heads_idx_to_patch,
                 timestep_start_patching=timestep_start_patching,
                 guidance_scale=GUIDANCE_SCALE,
-                device_map="balanced"  # Automatically distribute across available GPUs
+                # device_map is a load-time argument; dispatch already happened when loading the pipeline.
             ).images
             images = images * 255
             all_images[batch_start : batch_start + batch_size] = images.astype(np.uint8)
