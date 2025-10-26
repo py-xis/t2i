@@ -7,6 +7,7 @@ import time
 
 import clip
 import numpy as np
+import math
 import pandas as pd
 import torch
 from PIL import Image
@@ -292,6 +293,20 @@ for name, module in pipe.unet.named_modules():
         num_blocks += 1
 
 logging.info(f"Estimated cross-attention blocks: {num_blocks}")
+
+# Print an estimate of how many sample / pipeline calls will run
+N = len(prompts_A)
+B = BATCH_SIZE
+M = num_blocks
+batches_per_run = (N + B - 1) // B
+sample_calls = 2 + M  # 2 baselines + one per block
+total_pipe_calls = sample_calls * batches_per_run
+total_images = N * sample_calls
+logging.info(
+    f"Run estimate: N_prompts={N}, batch_size={B}, num_blocks={M}, "
+    f"sample_calls={sample_calls}, batches_per_run={batches_per_run}, "
+    f"total_pipe_calls={total_pipe_calls}, total_images={total_images}"
+)
 
 for attn_idx in tqdm(range(num_blocks)):
     patched_images = sample(
