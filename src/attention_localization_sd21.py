@@ -201,6 +201,35 @@ def make_step_tqdm(desc, total_steps):
     return _cb
 
 
+# Helper: set cache view for this batch (for custom attention processors)
+def set_cache_view(pipe, batch_num: int, batch_size: int):
+    """Tell the custom attention processors which slice of the global cache to use."""
+    procs = getattr(pipe.unet, "attn_processors", {}) or {}
+    for k, proc in procs.items():
+        # set on processor object (if it carries these attrs)
+        if hasattr(proc, "cache_batch_size"):
+            proc.cache_batch_size = batch_size
+        if hasattr(proc, "batch_num"):
+            proc.batch_num = batch_num
+        # also try to set on the corresponding attention module (attn2), since some builds
+        # read these attrs from the module rather than the processor
+        attn_key = k.replace(".processor", "")  # e.g., "...attn2"
+        mod = pipe.unet
+        try:
+            for part in attn_key.split("."):
+                if part.isdigit():
+                    mod = mod[int(part)]
+                else:
+                    mod = getattr(mod, part)
+            if hasattr(mod, "cache_batch_size"):
+                mod.cache_batch_size = batch_size
+            if hasattr(mod, "batch_num"):
+                mod.batch_num = batch_num
+        except Exception:
+            # best-effort: if path resolution fails on certain forks
+            pass
+
+
 def calculate_metrics(
     original_images_A,
     original_images_A_feats,
@@ -323,7 +352,9 @@ ocr_acc_B_sum = np.zeros(num_blocks, dtype=np.float64)
 count = 0
 for i in tqdm(range(0, N, BATCH_SIZE), desc="Batches", dynamic_ncols=True):
     sl = slice(i, i + BATCH_SIZE)
-    step_cb_B = make_step_tqdm(f"Steps B (batch {i//BATCH_SIZE+1})", NUM_INFERENCE_STEPS)
+    bn = i // BATCH_SIZE
+    set_cache_view(pipe, batch_num=bn, batch_size=BATCH_SIZE)
+    step_cb_B = make_step_tqdm(f"Steps B (batch {bn+1})", NUM_INFERENCE_STEPS)
     # 1) Populate cache for this batch using prompts_B (and also materialize baseline 'Model' images for this batch)
     out_B = pipe(
         prompt=[p["prompt"] for p in prompts_B][sl],
@@ -341,8 +372,9 @@ for i in tqdm(range(0, N, BATCH_SIZE), desc="Batches", dynamic_ncols=True):
         imgs_B = (imgs_B * 255.0).clip(0, 255).astype(np.uint8)
     model_mm[sl] = imgs_B
     # 2) For each layer, generate patched A for this batch using the populated cache
-    for attn_idx in tqdm(range(num_blocks), desc=f"Layers (batch {i//BATCH_SIZE+1})", leave=False, dynamic_ncols=True):
-        step_cb_A = make_step_tqdm(f"Steps A L{attn_idx} (batch {i//BATCH_SIZE+1})", NUM_INFERENCE_STEPS)
+    for attn_idx in tqdm(range(num_blocks), desc=f"Layers (batch {bn+1})", leave=False, dynamic_ncols=True):
+        set_cache_view(pipe, batch_num=bn, batch_size=BATCH_SIZE)
+        step_cb_A = make_step_tqdm(f"Steps A L{attn_idx} (batch {bn+1})", NUM_INFERENCE_STEPS)
         out_patch = pipe(
             prompt=[p["prompt"] for p in prompts_A][sl],
             num_inference_steps=NUM_INFERENCE_STEPS,
@@ -376,7 +408,7 @@ for i in tqdm(range(0, N, BATCH_SIZE), desc="Batches", dynamic_ncols=True):
             ocr_acc_A_sum[attn_idx] += np.sum(patched_metrics["OCR_A_Acc"])
             ocr_acc_B_sum[attn_idx] += np.sum(patched_metrics["OCR_B_Acc"])
         except Exception as e:
-            logging.warning(f"[batch {i//BATCH_SIZE}] Metrics for layer {attn_idx} failed: {e}")
+            logging.warning(f"[batch {bn}] Metrics for layer {attn_idx} failed: {e}")
     count += (sl.stop - sl.start)
     # 3) Clear cache before the next batch to keep memory bounded
     clear_attn_cache(pipe)
