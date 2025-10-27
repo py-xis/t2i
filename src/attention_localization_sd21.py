@@ -110,7 +110,7 @@ pipe = StableDiffusionPipeline.from_pretrained(
     device_map="balanced",
 )
 
-pipe.set_progress_bar_config(disable=True)
+pipe.set_progress_bar_config(disable=False)
 
 prompts_A, prompts_B = prepare_prompts_glyph_simple_bench_top_100(
     n_samples_per_prompt=N_SAMPLES_PER_PROMPT
@@ -188,6 +188,17 @@ def clear_attn_cache(pipe):
                 getattr(pipe.unet, a).clear()
             except Exception:
                 setattr(pipe.unet, a, {})
+
+
+def make_step_tqdm(desc, total_steps):
+    bar = tqdm(total=total_steps, desc=desc, leave=False, dynamic_ncols=True)
+    def _cb(*args, **kwargs):
+        # diffusers passes (step, timestep, latents) or (step, timestep, kwargs)
+        if bar.n < bar.total:
+            bar.update(1)
+        if bar.n >= bar.total:
+            bar.close()
+    return _cb
 
 
 def calculate_metrics(
@@ -310,8 +321,9 @@ logger.info("Starting batched localization with batch-synchronous caching...")
 ocr_acc_A_sum = np.zeros(num_blocks, dtype=np.float64)
 ocr_acc_B_sum = np.zeros(num_blocks, dtype=np.float64)
 count = 0
-for i in tqdm(range(0, N, BATCH_SIZE), desc="Batches"):
+for i in tqdm(range(0, N, BATCH_SIZE), desc="Batches", dynamic_ncols=True):
     sl = slice(i, i + BATCH_SIZE)
+    step_cb_B = make_step_tqdm(f"Steps B (batch {i//BATCH_SIZE+1})", NUM_INFERENCE_STEPS)
     # 1) Populate cache for this batch using prompts_B (and also materialize baseline 'Model' images for this batch)
     out_B = pipe(
         prompt=[p["prompt"] for p in prompts_B][sl],
@@ -321,13 +333,16 @@ for i in tqdm(range(0, N, BATCH_SIZE), desc="Batches"):
         run_with_cache=True,
         guidance_scale=GUIDANCE_SCALE,
         output_type="np",
+        callback=step_cb_B,
+        callback_steps=1,
     )
     imgs_B = out_B.images if isinstance(out_B.images, np.ndarray) else np.stack([np.array(im) for im in out_B.images], 0)
     if imgs_B.dtype != np.uint8:
         imgs_B = (imgs_B * 255.0).clip(0, 255).astype(np.uint8)
     model_mm[sl] = imgs_B
     # 2) For each layer, generate patched A for this batch using the populated cache
-    for attn_idx in range(num_blocks):
+    for attn_idx in tqdm(range(num_blocks), desc=f"Layers (batch {i//BATCH_SIZE+1})", leave=False, dynamic_ncols=True):
+        step_cb_A = make_step_tqdm(f"Steps A L{attn_idx} (batch {i//BATCH_SIZE+1})", NUM_INFERENCE_STEPS)
         out_patch = pipe(
             prompt=[p["prompt"] for p in prompts_A][sl],
             num_inference_steps=NUM_INFERENCE_STEPS,
@@ -338,6 +353,8 @@ for i in tqdm(range(0, N, BATCH_SIZE), desc="Batches"):
             timestep_start_patching=TIMESTEP_START_PATCHING,
             guidance_scale=GUIDANCE_SCALE,
             output_type="np",
+            callback=step_cb_A,
+            callback_steps=1,
         )
         imgs_patch = out_patch.images if isinstance(out_patch.images, np.ndarray) else np.stack([np.array(im) for im in out_patch.images], 0)
         if imgs_patch.dtype != np.uint8:
