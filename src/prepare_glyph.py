@@ -164,10 +164,18 @@ def prepare_prompts_glyph_creative_bench_top_100(n_samples_per_prompt=1, use_dif
     # make a derangement so each i maps to j != i, covering all words once
     idx = np.arange(n)
     perm = np.random.permutation(n)
-    while np.any(perm == idx):
-        # simple fix: rotate the offending positions
-        bad = np.where(perm == idx)[0]
-        perm[bad] = np.roll(perm[bad], 1)
+    fixed = np.where(perm == idx)[0]
+    if fixed.size == n:
+        # rare case: identity permutation; simple rotation deranges it
+        perm = np.roll(perm, 1)
+    else:
+        for i in fixed:
+            # pick a j != i and swap; this resolves the fixed point(s) without creating new ones
+            j = np.random.randint(0, n - 1)
+            if j >= i:
+                j += 1
+            perm[i], perm[j] = perm[j], perm[i]
+    assert not np.any(perm == idx)
 
     for i in range(n):
         text_A = all_words[i]
