@@ -1331,6 +1331,7 @@ class JointAttnProcessor2_0:
                     timestep, _bn * _cache_bs : (_bn + 1) * _cache_bs
                 ].to(encoder_hidden_states_query_proj.device)
 
+            # flatten back to (batch, seq, hidden)
             encoder_hidden_states_key_proj = encoder_hidden_states_key_proj.transpose(1, 2).reshape(
                 batch_size, -1, attn.heads * head_dim
             )
