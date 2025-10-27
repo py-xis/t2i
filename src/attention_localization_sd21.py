@@ -54,7 +54,7 @@ START_TIME = time.strftime("%Y%m%d_%H%M%S")
 SD21_MODEL_NAME_OR_PATH = "stabilityai/stable-diffusion-2-1"
 SEED = 42
 N_SAMPLES_PER_PROMPT = 1
-BATCH_SIZE = 4
+BATCH_SIZE = 2
 DEVICE = "cuda" if torch.cuda.is_available() else ("mps" if torch.backends.mps.is_available() else "cpu")
 NUM_INFERENCE_STEPS = 50
 
