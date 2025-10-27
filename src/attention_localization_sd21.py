@@ -203,31 +203,35 @@ def make_step_tqdm(desc, total_steps):
 
 # Helper: set cache view for this batch (for custom attention processors)
 def set_cache_view(pipe, batch_num: int, batch_size: int):
-    """Tell the custom attention processors which slice of the global cache to use."""
+    """Tell the custom attention processors which slice of the global cache to use.
+    Also sets attributes on every Attention module to cover forks that read from the module."""
+    def _set_alias_attrs(obj):
+        # Provide multiple alias names for maximum compatibility with different forks
+        for name in ("cache_batch_size", "cache_bsz", "cache_bs", "batch_size_cache", "batch_size"):
+            try:
+                setattr(obj, name, int(batch_size))
+            except Exception:
+                pass
+        for name in ("batch_num", "batch_idx", "cache_batch_num"):
+            try:
+                setattr(obj, name, int(batch_num))
+            except Exception:
+                pass
+
+    # 1) Set on all registered processors
     procs = getattr(pipe.unet, "attn_processors", {}) or {}
-    for k, proc in procs.items():
-        # set on processor object (if it carries these attrs)
-        if hasattr(proc, "cache_batch_size"):
-            proc.cache_batch_size = batch_size
-        if hasattr(proc, "batch_num"):
-            proc.batch_num = batch_num
-        # also try to set on the corresponding attention module (attn2), since some builds
-        # read these attrs from the module rather than the processor
-        attn_key = k.replace(".processor", "")  # e.g., "...attn2"
-        mod = pipe.unet
-        try:
-            for part in attn_key.split("."):
-                if part.isdigit():
-                    mod = mod[int(part)]
-                else:
-                    mod = getattr(mod, part)
-            if hasattr(mod, "cache_batch_size"):
-                mod.cache_batch_size = batch_size
-            if hasattr(mod, "batch_num"):
-                mod.batch_num = batch_num
-        except Exception:
-            # best-effort: if path resolution fails on certain forks
-            pass
+    for _, proc in procs.items():
+        _set_alias_attrs(proc)
+
+    # 2) Set on every Attention-like module (covers attn2 modules directly)
+    try:
+        from diffusers.models.attention import Attention as _DiffusersAttention
+    except Exception:
+        _DiffusersAttention = None
+
+    for mod in pipe.unet.modules():
+        if (_DiffusersAttention is not None and isinstance(mod, _DiffusersAttention)) or hasattr(mod, "processor"):
+            _set_alias_attrs(mod)
 
 
 def calculate_metrics(
@@ -352,8 +356,9 @@ ocr_acc_B_sum = np.zeros(num_blocks, dtype=np.float64)
 count = 0
 for i in tqdm(range(0, N, BATCH_SIZE), desc="Batches", dynamic_ncols=True):
     sl = slice(i, i + BATCH_SIZE)
+    cur_bs = sl.stop - sl.start
     bn = i // BATCH_SIZE
-    set_cache_view(pipe, batch_num=bn, batch_size=BATCH_SIZE)
+    set_cache_view(pipe, batch_num=bn, batch_size=cur_bs)
     step_cb_B = make_step_tqdm(f"Steps B (batch {bn+1})", NUM_INFERENCE_STEPS)
     # 1) Populate cache for this batch using prompts_B (and also materialize baseline 'Model' images for this batch)
     out_B = pipe(
@@ -373,7 +378,7 @@ for i in tqdm(range(0, N, BATCH_SIZE), desc="Batches", dynamic_ncols=True):
     model_mm[sl] = imgs_B
     # 2) For each layer, generate patched A for this batch using the populated cache
     for attn_idx in tqdm(range(num_blocks), desc=f"Layers (batch {bn+1})", leave=False, dynamic_ncols=True):
-        set_cache_view(pipe, batch_num=bn, batch_size=BATCH_SIZE)
+        set_cache_view(pipe, batch_num=bn, batch_size=cur_bs)
         step_cb_A = make_step_tqdm(f"Steps A L{attn_idx} (batch {bn+1})", NUM_INFERENCE_STEPS)
         out_patch = pipe(
             prompt=[p["prompt"] for p in prompts_A][sl],
