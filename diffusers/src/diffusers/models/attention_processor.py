@@ -1084,6 +1084,17 @@ class AttnAddedKVProcessor2_0:
                     attn.curr_cache_v = None
 
         elif patch_attn and timestep >= timestep_start_patching:
+            # Resolve cache slicing parameters. Some pipelines don't pass `batch_num`; fall back to attributes.
+            # `batch_size` here is the micro-batch size of this call; cache slice size may be provided via aliases.
+            _bn = batch_num if batch_num is not None else getattr(attn, "batch_num", getattr(self, "batch_num", 0))
+            _cache_bs = None
+            for _nm in ("cache_batch_size", "cache_bsz", "cache_bs", "batch_size_cache", "batch_size"):
+                _v = getattr(attn, _nm, None)
+                if isinstance(_v, int) and _v > 0:
+                    _cache_bs = _v
+                    break
+            if _cache_bs is None:
+                _cache_bs = batch_size
             if attn.cache_k is None or attn.cache_v is None:
                 raise ValueError("Cache is not initialized.")
             elif attn_heads_idx_to_patch is not None:
@@ -1099,7 +1110,7 @@ class AttnAddedKVProcessor2_0:
                     :,
                 ] = attn.cache_k[
                     timestep,
-                    batch_num * batch_size : (batch_num + 1) * batch_size,
+                    _bn * _cache_bs : (_bn + 1) * _cache_bs,
                     attn_heads_idx_to_patch,
                     :,
                     :,
@@ -1111,7 +1122,7 @@ class AttnAddedKVProcessor2_0:
                     :,
                 ] = attn.cache_v[
                     timestep,
-                    batch_num * batch_size : (batch_num + 1) * batch_size,
+                    _bn * _cache_bs : (_bn + 1) * _cache_bs,
                     attn_heads_idx_to_patch,
                     :,
                     :,
@@ -1119,10 +1130,10 @@ class AttnAddedKVProcessor2_0:
             else:
                 # patch all heads
                 encoder_hidden_states_key_proj = attn.cache_k[
-                    timestep, batch_num * batch_size : (batch_num + 1) * batch_size
+                    timestep, _bn * _cache_bs : (_bn + 1) * _cache_bs
                 ].to(query.device)
                 encoder_hidden_states_value_proj = attn.cache_v[
-                    timestep, batch_num * batch_size : (batch_num + 1) * batch_size
+                    timestep, _bn * _cache_bs : (_bn + 1) * _cache_bs
                 ].to(query.device)
         else:
             # default
@@ -1260,6 +1271,16 @@ class JointAttnProcessor2_0:
             )
 
         elif patch_attn and timestep >= timestep_start_patching:
+            # Resolve cache slicing parameters. Some pipelines don't pass `batch_num`; fall back to attributes.
+            _bn = batch_num if batch_num is not None else getattr(attn, "batch_num", getattr(self, "batch_num", 0))
+            _cache_bs = None
+            for _nm in ("cache_batch_size", "cache_bsz", "cache_bs", "batch_size_cache", "batch_size"):
+                _v = getattr(attn, _nm, None)
+                if isinstance(_v, int) and _v > 0:
+                    _cache_bs = _v
+                    break
+            if _cache_bs is None:
+                _cache_bs = batch_size
             if attn.cache_k is None or attn.cache_v is None:
                 raise ValueError("Cache is not initialized.")
             elif attn_heads_idx_to_patch is not None:
@@ -1284,7 +1305,7 @@ class JointAttnProcessor2_0:
                     :,
                 ] = attn.cache_k[
                     timestep,
-                    batch_num * batch_size : (batch_num + 1) * batch_size,
+                    _bn * _cache_bs : (_bn + 1) * _cache_bs,
                     attn_heads_idx_to_patch,
                     :,
                     :,
@@ -1296,7 +1317,7 @@ class JointAttnProcessor2_0:
                     :,
                 ] = attn.cache_v[
                     timestep,
-                    batch_num * batch_size : (batch_num + 1) * batch_size,
+                    _bn * _cache_bs : (_bn + 1) * _cache_bs,
                     attn_heads_idx_to_patch,
                     :,
                     :,
@@ -1304,10 +1325,10 @@ class JointAttnProcessor2_0:
             else:
                 # patch all heads
                 encoder_hidden_states_key_proj = attn.cache_k[
-                    timestep, batch_num * batch_size : (batch_num + 1) * batch_size
+                    timestep, _bn * _cache_bs : (_bn + 1) * _cache_bs
                 ].to(encoder_hidden_states_query_proj.device)
                 encoder_hidden_states_value_proj = attn.cache_v[
-                    timestep, batch_num * batch_size : (batch_num + 1) * batch_size
+                    timestep, _bn * _cache_bs : (_bn + 1) * _cache_bs
                 ].to(encoder_hidden_states_query_proj.device)
 
             encoder_hidden_states_key_proj = encoder_hidden_states_key_proj.transpose(1, 2).reshape(
