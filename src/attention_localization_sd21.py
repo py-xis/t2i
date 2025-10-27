@@ -162,8 +162,15 @@ def sample(
             attn_heads_idx_to_patch=attn_heads_idx_to_patch,
             timestep_start_patching=timestep_start_patching,
             guidance_scale=GUIDANCE_SCALE,
+            output_type="np",
         )
-        images = (out.images * 255).astype(np.uint8)
+        images = out.images
+        # If pipeline returned PIL images (list), convert to numpy
+        if isinstance(images, list):
+            images = np.stack([np.array(im) for im in images], axis=0)
+        # Ensure uint8 in [0, 255]
+        if images.dtype != np.uint8:
+            images = (images * 255.0).clip(0, 255).astype(np.uint8)
         all_images[i : i + batch_size] = images
     return all_images
 
