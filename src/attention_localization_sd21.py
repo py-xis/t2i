@@ -175,6 +175,21 @@ def sample(
     return all_images
 
 
+def clear_attn_cache(pipe):
+    # Prefer an official method if your patched pipeline added one
+    for attr in ("clear_attention_cache", "reset_attention_cache", "reset_cache"):
+        if hasattr(pipe, attr):
+            getattr(pipe, attr)()
+            return
+    # Fallback: best-effort
+    for a in ("_attention_cache", "attention_cache", "attn_cache"):
+        if hasattr(pipe.unet, a):
+            try:
+                getattr(pipe.unet, a).clear()
+            except Exception:
+                setattr(pipe.unet, a, {})
+
+
 def calculate_metrics(
     original_images_A,
     original_images_A_feats,
@@ -243,54 +258,13 @@ original_images_A_feats = extract_all_images(
     original_images_A, clip_model, DEVICE, batch_size=BATCH_SIZE
 )
 
-logging.info("Sampling original images B ...")
-original_images_B = sample(
-    [p["prompt"] for p in prompts_B],
-    noises,
-    BATCH_SIZE,
-    NUM_INFERENCE_STEPS,
-    torch.Generator().manual_seed(SEED),
-    DEVICE,
-    run_with_cache=True,
-    timestep_start_patching=TIMESTEP_START_PATCHING,
-)
-np.save(os.path.join(SAVE_DIR, "Model.npy"), original_images_B)
-
-original_images_A_metrics = calculate_metrics(
-    original_images_A,
-    original_images_A_feats,
-    original_images_A,
-    [p["text"] for p in prompts_A],
-    [p["text"] for p in prompts_B],
-    [p["prompt"] for p in prompts_A],
-    [p["prompt"] for p in prompts_B],
-    DEVICE,
-    BATCH_SIZE,
-)
-
-original_images_B_metrics = calculate_metrics(
-    original_images_A,
-    original_images_A_feats,
-    original_images_B,
-    [p["text"] for p in prompts_A],
-    [p["text"] for p in prompts_B],
-    [p["prompt"] for p in prompts_A],
-    [p["prompt"] for p in prompts_B],
-    DEVICE,
-    BATCH_SIZE,
-)
-
-original_images_A_df = pd.DataFrame(
-    original_images_A_metrics,
-)
-original_images_A_df["Block_patched"] = ["-" for _ in range(len(prompts_A))]
-original_images_B_df = pd.DataFrame(
-    original_images_B_metrics,
-    index=["Model" for _ in range(len(prompts_A))],
-)
-original_images_B_df["Block_patched"] = ["Model" for _ in range(len(prompts_B))]
-
-all_metrics_df = pd.concat([original_images_A_df, original_images_B_df])
+# Prepare memmaps for baseline "Model" and for each patched layer to keep RAM bounded
+N = len(prompts_A)
+H, W, C = 512, 512, 3
+model_mm_path = os.path.join(SAVE_DIR, "Model.dat")
+model_mm = np.memmap(model_mm_path, dtype=np.uint8, mode="w+", shape=(N, H, W, C))
+layer_mm_paths = {}
+layer_mm = {}
 
  # Discover cross-attention processors in the UNet (SD v1/v2)
  # diffusers exposes a mapping of attention processors; cross-attn processors end with "attn2.processor"
@@ -311,6 +285,12 @@ try:
 except Exception as e:
     logging.warning(f"Could not save cross-attention index map: {e}")
 
+# Allocate per-layer memmaps
+for attn_idx in range(num_blocks):
+    p = os.path.join(SAVE_DIR, f"A_layer{attn_idx:03d}.dat")
+    layer_mm_paths[attn_idx] = p
+    layer_mm[attn_idx] = np.memmap(p, dtype=np.uint8, mode="w+", shape=(N, H, W, C))
+
 # Print an estimate of how many sample / pipeline calls will run
 N = len(prompts_A)
 B = BATCH_SIZE
@@ -325,47 +305,99 @@ logging.info(
     f"total_pipe_calls={total_pipe_calls}, total_images={total_images}"
 )
 
-for attn_idx in tqdm(range(num_blocks)):
-    logging.info(f"Processing attention block: {attn_idx}")
-
-    # Perform sampling with the specific attention block patched
-    patched_images = sample(
-        [p["prompt"] for p in prompts_A],
-        noises,
-        BATCH_SIZE,
-        NUM_INFERENCE_STEPS,
-        torch.Generator().manual_seed(SEED),
-        DEVICE,
-        run_with_cache=False,
-        attn_idx_to_patch=attn_idx,
-        timestep_start_patching=TIMESTEP_START_PATCHING,
+# Batched, cache-local localization to avoid blowing host RAM
+logger.info("Starting batched localization with batch-synchronous caching...")
+ocr_acc_A_sum = np.zeros(num_blocks, dtype=np.float64)
+ocr_acc_B_sum = np.zeros(num_blocks, dtype=np.float64)
+count = 0
+for i in tqdm(range(0, N, BATCH_SIZE), desc="Batches"):
+    sl = slice(i, i + BATCH_SIZE)
+    # 1) Populate cache for this batch using prompts_B (and also materialize baseline 'Model' images for this batch)
+    out_B = pipe(
+        prompt=[p["prompt"] for p in prompts_B][sl],
+        num_inference_steps=NUM_INFERENCE_STEPS,
+        generator=torch.Generator().manual_seed(SEED),
+        latents=noises[sl].to(DEVICE),
+        run_with_cache=True,
+        guidance_scale=GUIDANCE_SCALE,
+        output_type="np",
     )
-
-    # Save the patched images
-    save_path = os.path.join(SAVE_DIR, f"A{set_to_string([attn_idx])}.npy")
-    logging.info(f"Saving patched images to: {save_path}")
-    np.save(save_path, patched_images)
-    try:
-        patched_metrics = calculate_metrics(
-            original_images_A,
-            original_images_A_feats,
-            patched_images,
-            [p["text"] for p in prompts_A],
-            [p["text"] for p in prompts_B],
-            [p["prompt"] for p in prompts_A],
-            [p["prompt"] for p in prompts_B],
-            DEVICE,
-            BATCH_SIZE,
+    imgs_B = out_B.images if isinstance(out_B.images, np.ndarray) else np.stack([np.array(im) for im in out_B.images], 0)
+    if imgs_B.dtype != np.uint8:
+        imgs_B = (imgs_B * 255.0).clip(0, 255).astype(np.uint8)
+    model_mm[sl] = imgs_B
+    # 2) For each layer, generate patched A for this batch using the populated cache
+    for attn_idx in range(num_blocks):
+        out_patch = pipe(
+            prompt=[p["prompt"] for p in prompts_A][sl],
+            num_inference_steps=NUM_INFERENCE_STEPS,
+            generator=torch.Generator().manual_seed(SEED),
+            latents=noises[sl].to(DEVICE),
+            run_with_cache=False,
+            attn_idx_to_patch=attn_idx,
+            timestep_start_patching=TIMESTEP_START_PATCHING,
+            guidance_scale=GUIDANCE_SCALE,
+            output_type="np",
         )
-        # Only keep light-weight scalars we care about for localization
-        layer_f1_A = np.mean(patched_metrics["OCR_A_Acc"])
-        layer_f1_B = np.mean(patched_metrics["OCR_B_Acc"])
-        logging.info(f"Layer {attn_idx} ({cross_attn_keys[attn_idx]}): OCR_A_Acc={layer_f1_A:.4f} OCR_B_Acc={layer_f1_B:.4f}")
-    except Exception as e:
-        logging.warning(f"Metrics for layer {attn_idx} failed: {e}")
+        imgs_patch = out_patch.images if isinstance(out_patch.images, np.ndarray) else np.stack([np.array(im) for im in out_patch.images], 0)
+        if imgs_patch.dtype != np.uint8:
+            imgs_patch = (imgs_patch * 255.0).clip(0, 255).astype(np.uint8)
+        layer_mm[attn_idx][sl] = imgs_patch
+        # quick scalar metrics per layer (OCR acc) to help choose localized layers
+        try:
+            patched_metrics = calculate_metrics(
+                original_images_A[sl],
+                original_images_A_feats,   # features of full A; function uses only needed parts
+                imgs_patch,
+                [p["text"] for p in prompts_A][sl],
+                [p["text"] for p in prompts_B][sl],
+                [p["prompt"] for p in prompts_A][sl],
+                [p["prompt"] for p in prompts_B][sl],
+                DEVICE,
+                BATCH_SIZE,
+            )
+            ocr_acc_A_sum[attn_idx] += np.sum(patched_metrics["OCR_A_Acc"])
+            ocr_acc_B_sum[attn_idx] += np.sum(patched_metrics["OCR_B_Acc"])
+        except Exception as e:
+            logging.warning(f"[batch {i//BATCH_SIZE}] Metrics for layer {attn_idx} failed: {e}")
+    count += (sl.stop - sl.start)
+    # 3) Clear cache before the next batch to keep memory bounded
+    clear_attn_cache(pipe)
+    # Opportunistic cleanup
+    del out_B; torch.cuda.empty_cache()
+# Save per-layer images to .npy (streaming from memmap)
+for attn_idx in range(num_blocks):
+    arr = np.memmap(layer_mm_paths[attn_idx], dtype=np.uint8, mode="r", shape=(N, H, W, C))
+    np.save(os.path.join(SAVE_DIR, f"A{set_to_string([attn_idx])}.npy"), np.asarray(arr))
+    del arr
+# Save Model baseline as .npy
+arrM = np.memmap(model_mm_path, dtype=np.uint8, mode="r", shape=(N, H, W, C))
+np.save(os.path.join(SAVE_DIR, "Model.npy"), np.asarray(arrM))
+del arrM
+# Log layer-wise OCR means
+with open(os.path.join(SAVE_DIR, "layer_ocr_summary.txt"), "w") as f:
+    for attn_idx in range(num_blocks):
+        meanA = ocr_acc_A_sum[attn_idx] / max(1, count)
+        meanB = ocr_acc_B_sum[attn_idx] / max(1, count)
+        msg = f"Layer {attn_idx} ({cross_attn_keys[attn_idx]}): mean OCR_A_Acc={meanA:.4f} mean OCR_B_Acc={meanB:.4f}"
+        logging.info(msg)
+        f.write(msg + "\n")
 
- # Save DataFrame to CSV file
-all_metrics_df.to_csv(os.path.join(SAVE_DIR, "metrics.csv"))
-all_metrics_df.to_csv(os.path.join(SAVE_DIR, "metrics_baseline.csv"))
+# Save baseline metrics for A; per-layer summaries were saved separately
+original_images_A_df = pd.DataFrame(
+    calculate_metrics(
+        original_images_A,
+        original_images_A_feats,
+        original_images_A,
+        [p["text"] for p in prompts_A],
+        [p["text"] for p in prompts_B],
+        [p["prompt"] for p in prompts_A],
+        [p["prompt"] for p in prompts_B],
+        DEVICE,
+        BATCH_SIZE,
+    ),
+)
+original_images_A_df["Block_patched"] = ["-" for _ in range(len(prompts_A))]
+original_images_A_df.to_csv(os.path.join(SAVE_DIR, "metrics_baseline.csv"))
 
 logging.info("Finito!")
