@@ -4,6 +4,7 @@ import logging
 import os
 import sys
 import time
+import json
 
 import clip
 import numpy as np
@@ -56,7 +57,9 @@ N_SAMPLES_PER_PROMPT = 1
 BATCH_SIZE = 4
 DEVICE = "cuda" if torch.cuda.is_available() else ("mps" if torch.backends.mps.is_available() else "cpu")
 NUM_INFERENCE_STEPS = 50
+
 GUIDANCE_SCALE = 7.5
+TIMESTEP_START_PATCHING = 46  # start patching late to preserve background (see paper Appendix B)
 
 
 def set_to_string(int_set):
@@ -136,6 +139,7 @@ clip_model.eval()
 def sample(
     prompts,
     noise,
+    batch_size,
     num_inference_steps,
     generator,
     device,
@@ -144,21 +148,24 @@ def sample(
     attn_heads_idx_to_patch=None,
     timestep_start_patching=0,
 ):
-    # Process all prompts in a single call
-    latent = noise.to(device)
-    images = pipe(
-        prompt=prompts,
-        num_inference_steps=num_inference_steps,
-        generator=generator,
-        latents=latent,
-        run_with_cache=run_with_cache,
-        attn_idx_to_patch=attn_idx_to_patch,
-        attn_heads_idx_to_patch=attn_heads_idx_to_patch,
-        timestep_start_patching=timestep_start_patching,
-        guidance_scale=GUIDANCE_SCALE,
-    ).images
-    images = (images * 255).astype(np.uint8)
-    return images
+    all_images = np.zeros((len(prompts), 512, 512, 3), dtype=np.uint8)
+    for i in range(0, len(prompts), batch_size):
+        sub_prompts = prompts[i : i + batch_size]
+        sub_latents = noise[i : i + batch_size].to(device)
+        out = pipe(
+            prompt=sub_prompts,
+            num_inference_steps=num_inference_steps,
+            generator=generator,
+            latents=sub_latents,
+            run_with_cache=run_with_cache,
+            attn_idx_to_patch=attn_idx_to_patch,
+            attn_heads_idx_to_patch=attn_heads_idx_to_patch,
+            timestep_start_patching=timestep_start_patching,
+            guidance_scale=GUIDANCE_SCALE,
+        )
+        images = (out.images * 255).astype(np.uint8)
+        all_images[i : i + batch_size] = images
+    return all_images
 
 
 def calculate_metrics(
@@ -216,10 +223,12 @@ logging.info("Sampling original images A ...")
 original_images_A = sample(
     [p["prompt"] for p in prompts_A],
     noises,
+    BATCH_SIZE,
     NUM_INFERENCE_STEPS,
     torch.Generator().manual_seed(SEED),
     DEVICE,
     run_with_cache=False,
+    timestep_start_patching=0,
 )
 np.save(os.path.join(SAVE_DIR, "None.npy"), original_images_A)
 
@@ -231,10 +240,12 @@ logging.info("Sampling original images B ...")
 original_images_B = sample(
     [p["prompt"] for p in prompts_B],
     noises,
+    BATCH_SIZE,
     NUM_INFERENCE_STEPS,
     torch.Generator().manual_seed(SEED),
     DEVICE,
     run_with_cache=True,
+    timestep_start_patching=TIMESTEP_START_PATCHING,
 )
 np.save(os.path.join(SAVE_DIR, "Model.npy"), original_images_B)
 
@@ -274,14 +285,24 @@ original_images_B_df["Block_patched"] = ["Model" for _ in range(len(prompts_B))]
 
 all_metrics_df = pd.concat([original_images_A_df, original_images_B_df])
 
-# Try to infer the number of cross-attention blocks by counting Attention processors with cross-attn
-num_blocks = 0
-for name, module in pipe.unet.named_modules():
-    if hasattr(module, "__class__") and module.__class__.__name__ in ("BasicTransformerBlock",):
-        # Basic heuristic: SD v1/v2 CrossAttn blocks include BasicTransformerBlock with context
-        num_blocks += 1
+ # Discover cross-attention processors in the UNet (SD v1/v2)
+ # diffusers exposes a mapping of attention processors; cross-attn processors end with "attn2.processor"
+attn_proc_map = getattr(pipe.unet, "attn_processors", None)
+if attn_proc_map is None:
+    raise RuntimeError("UNet does not expose attn_processors; ensure diffusers >= 0.20 or use the patched local diffusers in this repo.")
 
-logging.info(f"Estimated cross-attention blocks: {num_blocks}")
+cross_attn_keys = [k for k in attn_proc_map.keys() if k.endswith("attn2.processor")]
+num_blocks = len(cross_attn_keys)
+logging.info(f"Detected {num_blocks} cross-attention processors (attn2) in UNet.")
+
+# Persist the index->module-name mapping for reproducibility / debugging
+idx_to_key_path = os.path.join(SAVE_DIR, "sd21_cross_attn_idx_to_key.json")
+try:
+    with open(idx_to_key_path, "w") as f:
+        json.dump({i: k for i, k in enumerate(cross_attn_keys)}, f, indent=2)
+    logging.info(f"Saved cross-attention index map to: {idx_to_key_path}")
+except Exception as e:
+    logging.warning(f"Could not save cross-attention index map: {e}")
 
 # Print an estimate of how many sample / pipeline calls will run
 N = len(prompts_A)
@@ -304,19 +325,40 @@ for attn_idx in tqdm(range(num_blocks)):
     patched_images = sample(
         [p["prompt"] for p in prompts_A],
         noises,
+        BATCH_SIZE,
         NUM_INFERENCE_STEPS,
         torch.Generator().manual_seed(SEED),
         DEVICE,
         run_with_cache=False,
         attn_idx_to_patch=attn_idx,
+        timestep_start_patching=TIMESTEP_START_PATCHING,
     )
 
     # Save the patched images
     save_path = os.path.join(SAVE_DIR, f"A{set_to_string([attn_idx])}.npy")
     logging.info(f"Saving patched images to: {save_path}")
     np.save(save_path, patched_images)
+    try:
+        patched_metrics = calculate_metrics(
+            original_images_A,
+            original_images_A_feats,
+            patched_images,
+            [p["text"] for p in prompts_A],
+            [p["text"] for p in prompts_B],
+            [p["prompt"] for p in prompts_A],
+            [p["prompt"] for p in prompts_B],
+            DEVICE,
+            BATCH_SIZE,
+        )
+        # Only keep light-weight scalars we care about for localization
+        layer_f1_A = np.mean(patched_metrics["OCR_A_Acc"])
+        layer_f1_B = np.mean(patched_metrics["OCR_B_Acc"])
+        logging.info(f"Layer {attn_idx} ({cross_attn_keys[attn_idx]}): OCR_A_Acc={layer_f1_A:.4f} OCR_B_Acc={layer_f1_B:.4f}")
+    except Exception as e:
+        logging.warning(f"Metrics for layer {attn_idx} failed: {e}")
 
-# Save DataFrame to CSV file
+ # Save DataFrame to CSV file
 all_metrics_df.to_csv(os.path.join(SAVE_DIR, "metrics.csv"))
+all_metrics_df.to_csv(os.path.join(SAVE_DIR, "metrics_baseline.csv"))
 
 logging.info("Finito!")
